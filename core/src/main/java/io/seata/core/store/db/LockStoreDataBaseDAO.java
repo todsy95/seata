@@ -15,24 +15,27 @@
  */
 package io.seata.core.store.db;
 
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.util.ArrayList;
-import java.util.List;
-
-import javax.sql.DataSource;
-
 import io.seata.common.exception.StoreException;
 import io.seata.common.executor.Initialize;
 import io.seata.common.loader.LoadLevel;
+import io.seata.common.util.CollectionUtils;
 import io.seata.common.util.StringUtils;
 import io.seata.config.Configuration;
 import io.seata.config.ConfigurationFactory;
 import io.seata.core.constants.ConfigurationKeys;
 import io.seata.core.store.LockDO;
 import io.seata.core.store.LockStore;
+
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * The type Data base lock store.
@@ -86,9 +89,7 @@ public class LockStoreDataBaseDAO implements LockStore, Initialize {
 
     @Override
     public boolean acquireLock(LockDO lockDO) {
-        List<LockDO> locks = new ArrayList<>();
-        locks.add(lockDO);
-        return acquireLock(locks);
+        return acquireLock(Collections.singletonList(lockDO));
     }
 
     @Override
@@ -96,6 +97,8 @@ public class LockStoreDataBaseDAO implements LockStore, Initialize {
         Connection conn = null;
         PreparedStatement ps = null;
         ResultSet rs = null;
+        List<LockDO> unrepeatedLockDOs = null;
+        Set<String> dbExistedRowKeys = new HashSet<>();
         try {
             conn = logStoreDataSource.getConnection();
             conn.setAutoCommit(false);
@@ -108,7 +111,7 @@ public class LockStoreDataBaseDAO implements LockStore, Initialize {
                     sb.append(", ");
                 }
             }
-            boolean canLock = true, isReLock = false;
+            boolean canLock = true;
             //query
             String checkLockSQL = LockStoreSqls.getCheckLockableSql(lockTable, sb.toString(), dbType);
             ps = conn.prepareStatement(checkLockSQL);
@@ -117,25 +120,29 @@ public class LockStoreDataBaseDAO implements LockStore, Initialize {
             }
             rs = ps.executeQuery();
             while (rs.next()) {
-                if (StringUtils.equals(rs.getString("xid"), lockDOs.get(0).getXid())) {
-                    isReLock = true;
-                } else {
+                if (!StringUtils.equals(rs.getString("xid"), lockDOs.get(0).getXid())) {
                     canLock &= false;
+                    break;
                 }
+                dbExistedRowKeys.add(rs.getString("row_key"));
             }
 
             if (!canLock) {
                 conn.rollback();
                 return false;
             }
-
-            if (isReLock) {
+            if (CollectionUtils.isNotEmpty(dbExistedRowKeys)) {
+                unrepeatedLockDOs = lockDOs.stream().filter(lockDO -> !dbExistedRowKeys.contains(lockDO.getRowKey())).collect(Collectors.toList());
+            } else {
+                unrepeatedLockDOs = lockDOs;
+            }
+            if (CollectionUtils.isEmpty(unrepeatedLockDOs)) {
                 conn.rollback();
                 return true;
             }
 
             //lock
-            for (LockDO lockDO : lockDOs) {
+            for (LockDO lockDO : unrepeatedLockDOs) {
                 if (!doAcquireLock(conn, lockDO)) {
                     conn.rollback();
                     return false;
@@ -169,9 +176,7 @@ public class LockStoreDataBaseDAO implements LockStore, Initialize {
 
     @Override
     public boolean unLock(LockDO lockDO) {
-        List<LockDO> locks = new ArrayList<>();
-        locks.add(lockDO);
-        return unLock(locks);
+        return unLock(Collections.singletonList(lockDO));
     }
 
     @Override
@@ -246,7 +251,6 @@ public class LockStoreDataBaseDAO implements LockStore, Initialize {
      */
     protected boolean doAcquireLock(Connection conn, LockDO lockDO) {
         PreparedStatement ps = null;
-        ResultSet rs = null;
         try {
             //insert
             String insertLockSQL = LockStoreSqls.getInsertLockSQL(lockTable, dbType);
@@ -262,12 +266,6 @@ public class LockStoreDataBaseDAO implements LockStore, Initialize {
         } catch (SQLException e) {
             throw new StoreException(e);
         } finally {
-            if (rs != null) {
-                try {
-                    rs.close();
-                } catch (SQLException e) {
-                }
-            }
             if (ps != null) {
                 try {
                     ps.close();
